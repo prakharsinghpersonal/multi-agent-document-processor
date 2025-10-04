@@ -1,11 +1,32 @@
-crewai
-crewai_tools
-langchain
-langchain-google-genai
-langchain-astradb
-langchain-community
+# Multi-Agent Document Processor Dependencies
+
+# Core Framework
+crewai>=0.201.0
+crewai-tools>=0.75.0
+
+# Language Models & AI
+langchain>=0.3.0
+langchain-openai>=0.3.0
+langchain-community>=0.3.0
+langchain-google-genai>=2.1.0
+langchain-astradb>=0.6.0
+
+# Web Interface
+streamlit>=1.50.0
+
+# Environment & Configuration
+python-dotenv>=1.0.0
+
+# Document Processing
+pypdf>=4.0.0
+unstructured>=0.10.0
+langchain-community[document-loaders]>=0.3.0
+
+# Database & Vector Storage
 astrapy>=1.0.0
-streamlit
-python-dotenv
-unstructured
-pypdf 
+
+# Utilities
+tempfile
+os
+json
+typing
