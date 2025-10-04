@@ -1,0 +1,192 @@
+# To-Do List #2: Fix Agent Hallucination by Improving Prompts
+
+This file outlines the necessary code changes to constrain the AI agents, forcing them to extract data ONLY from the provided document text and preventing them from inventing information.
+
+---
+
+### [ ] Task 1: Strengthen the Task Descriptions
+
+**File:** `tasks.py`
+**Action:** Replace the entire content of this file. The new descriptions are more specific and command the agents to use the context provided by the previous task.
+
+--- CODE START ---
+from crewai import Task
+from agents import triage_agent, extraction_agent, safety_agent, seriousness_agent
+
+# Task 1: Triage the document
+triage_task = Task(
+    description=(
+        "Load the medical document from the provided file path, extract its text, and "
+        "identify the form type from the text content. You must use the 'Document Loader Tool' first."
+    ),
+    expected_output=(
+        "A string containing the full text content of the document, and a second string "
+        "identifying the form type (e.g., MedWatch, CIOMS, or E2B)."
+    ),
+    agent=triage_agent
+)
+
+# Task 2: Extract and store data
+extraction_task = Task(
+    description=(
+        "Using the document text provided in the context from the triage_task, and ONLY that text, "
+        "extract all key medical information. Do not use any external knowledge or make up information. "
+        "After extraction, store this structured data in the AstraDB vector database."
+    ),
+    expected_output=(
+        "A confirmation message that data was successfully stored in AstraDB, including the new Case ID. "
+        "The message should also include the extracted event description to pass to the next task."
+    ),
+    agent=extraction_agent,
+    context=[triage_task]
+)
+
+# Task 3: Assess for adverse event
+assessment_task = Task(
+    description=(
+        "Analyze ONLY the extracted event description provided in the context from the previous task. "
+        "Classify whether the event is an adverse event based on this description alone."
+    ),
+    expected_output=(
+        'A classification of "Yes" or "No", along with the original event description for context.'
+    ),
+    agent=safety_agent,
+    context=[extraction_task]
+)
+
+# Task 4: Classify seriousness
+seriousness_task = Task(
+    description=(
+        "Review the context from the previous task. If the event was classified as 'Yes' (adverse), "
+        "analyze its description and classify its seriousness based on standard criteria "
+        "(Death, Life-Threatening, Hospitalization, Disability, Congenital Anomaly). "
+        "Use only the provided description. If the event was 'No', state that no seriousness classification is needed."
+    ),
+    expected_output=(
+        'A final JSON report containing the adverse event status ("Yes" or "No") and, if applicable, '
+        'a list of any identified seriousness criteria.'
+    ),
+    agent=seriousness_agent,
+    context=[assessment_task]
+)
+--- CODE END ---
+
+---
+
+### [ ] Task 2: Strengthen the Prompts Inside the Tools
+
+**File:** `tools.py`
+**Action:** Replace the entire content of this file. The new prompts are much more explicit, providing strict rules for the LLM to follow.
+
+--- CODE START ---
+import os
+import json
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_astradb import AstraDBVectorStore
+from langchain.tools import tool
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Initialize Connections ---
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+google_embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+# Setup connection to AstraDB
+vstore = AstraDBVectorStore(
+    embedding=google_embeddings,
+    collection_name="pharmacovigilance_reports",
+    api_endpoint=os.getenv("ASTRA_DB_API_ENDPOINT"),
+    token=os.getenv("ASTRA_DB_APPLICATION_TOKEN"),
+)
+
+# --- Define Tools with Strong Prompts ---
+@tool("Document Loader Tool")
+def load_document(file_path: str) -> str:
+    """Loads a document (.txt or .pdf) and returns its text content."""
+    if file_path.endswith(".pdf"):
+        loader = PyPDFLoader(file_path)
+    else:
+        loader = TextLoader(file_path)
+    documents = loader.load()
+    return "\n".join(doc.page_content for doc in documents)
+
+@tool("Form Triage Tool")
+def identify_form_type(document_text: str) -> str:
+    """Identifies the type of medical form (MedWatch, CIOMS, E2B) from its content."""
+    prompt = f"""
+    Based ONLY on the text below, identify the form type.
+    The possible types are: MedWatch, CIOMS, E2B.
+    Return ONLY the name of the form type and nothing else.
+
+    TEXT:
+    ---
+    {document_text}
+    ---
+    """
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
+@tool("Data Extraction and Storage Tool")
+def extract_and_store_data(document_text: str) -> str:
+    """Extracts key medical data from a document, stores it in AstraDB, and returns a success message including the case ID and event description."""
+    prompt = f"""
+    You are a precise medical data extraction assistant. Your task is to analyze the provided medical document text and extract the specified entities.
+
+    RULES:
+    1. You MUST ONLY use information present in the text provided below.
+    2. DO NOT use any prior knowledge or invent any information.
+    3. If a specific piece of information (e.g., patient_id) is not found in the text, you MUST return "Not Found" for that field.
+    4. Return the result as a single, clean JSON object with no extra text or explanations.
+
+    TEXT TO ANALYZE:
+    ---
+    {document_text}
+    ---
+    
+    EXTRACTED JSON:
+    """
+    response_content = llm.invoke(prompt).content
+    
+    try:
+        json_str = response_content.strip().replace("```json", "").replace("```", "")
+        data = json.loads(json_str)
+        
+        event_description = data.get('event_description', 'N/A')
+        text_to_embed = f"Event Description: {event_description} for Drug: {data.get('drug_name', 'N/A')}"
+        
+        ids = vstore.add_texts([text_to_embed], metadatas=[data])
+        
+        # Pass both a success message and the crucial event description forward
+        return f"Successfully stored data in AstraDB. Case ID(s): {ids}. Event Description: {event_description}"
+    except Exception as e:
+        return f"Error in data extraction or storage: {e}. Raw LLM output was: {response_content}"
+
+@tool("Adverse Event Classifier Tool")
+def classify_adverse_event(event_description: str) -> str:
+    """Classifies if an event is an 'Adverse Event' or 'Not an Adverse Event'."""
+    prompt = f"Is the following an adverse event? Answer only with 'Yes' or 'No'. Description: {event_description}"
+    response = llm.invoke(prompt)
+    return f"Classification: {response.content.strip()}. Original Description: {event_description}"
+
+@tool("Seriousness Classifier Tool")
+def classify_seriousness(event_description: str) -> str:
+    """Classifies the seriousness of an adverse event based on its description."""
+    prompt = f"""
+    Review ONLY the event description provided. Does it meet any of the following seriousness criteria: Death, Life-Threatening, Hospitalization, Disability, Congenital Anomaly? 
+    Return a Python list of the criteria that apply as a string. If none apply, return an empty list string '[]'.
+    Description: {event_description}
+    """
+    response = llm.invoke(prompt)
+    return response.content.strip()
+--- CODE END ---
+
+---
+
+### [ ] Task 3: Test the Changes
+
+**File:** `app.py`
+**Action:** No code changes needed. Run the Streamlit application and re-upload your CIOMS PDF.
+**Command:** `streamlit run app.py`
+**Expected Result:** The agents should now correctly identify the form as "CIOMS" and extract the actual data from the document (e.g., "Sirolimus", "pancreatitis") instead of hallucinating about "Acetaminophen".

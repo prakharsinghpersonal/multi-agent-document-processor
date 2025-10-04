@@ -1,7 +1,9 @@
 crewai
 crewai_tools
+langchain
 langchain-google-genai
 langchain-astradb
+langchain-community
 astrapy>=1.0.0
 streamlit
 python-dotenv

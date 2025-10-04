@@ -1,0 +1,280 @@
+# To-Do List: Refactor and Enhance the "CogniVigilance" AI Agent Project
+
+This file contains a complete set of instructions to fix the tool integration issues, strengthen the agent workflow, and build a professional Streamlit UI with real-time logging.
+
+---
+
+### [ ] Task 1: Overhaul the Tools for Reliability
+
+**File:** `tools.py`
+**Action:** Replace the entire content of this file. This version simplifies the tool definitions, adds explicit docstrings for the agents to understand their function, and ensures correct data handling.
+
+--- CODE START ---
+import os
+import json
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_astradb import AstraDBVectorStore
+from langchain.tools import tool
+from dotenv import load_dotenv
+
+# --- Initialize Connections ---
+load_dotenv()
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+google_embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+# Ensure environment variables are set
+if not all([os.getenv("ASTRA_DB_API_ENDPOINT"), os.getenv("ASTRA_DB_APPLICATION_TOKEN"), os.getenv("GOOGLE_API_KEY")]):
+    raise ValueError("Required environment variables are not set. Please check your .env file.")
+
+# Setup connection to AstraDB
+vstore = AstraDBVectorStore(
+    embedding=google_embeddings,
+    collection_name="pharmacovigilance_reports",
+    api_endpoint=os.getenv("ASTRA_DB_API_ENDPOINT"),
+    token=os.getenv("ASTRA_DB_APPLICATION_TOKEN"),
+)
+
+# --- Define Tools with Clear Docstrings ---
+@tool
+def extract_and_store_data(document_text: str) -> str:
+    """
+    Extracts key medical information from a document, stores it in AstraDB, 
+    and returns a JSON string containing the extracted data and the database ID.
+    The input is the full text of the medical document.
+    """
+    prompt = f"""
+    You are a precise medical data extraction assistant. Based ONLY on the text below, extract these entities: 
+    patient_id, drug_name, event_description, event_date.
+    If a field is not found, use "Not Found".
+    Return the data as a single, clean JSON object.
+
+    TEXT:
+    ---
+    {document_text}
+    ---
+    
+    JSON:
+    """
+    response_content = llm.invoke(prompt).content
+    
+    try:
+        json_str = response_content.strip().replace("```json", "").replace("```", "")
+        data = json.loads(json_str)
+        
+        text_to_embed = f"Event Description: {data.get('event_description', 'N/A')} for Drug: {data.get('drug_name', 'N/A')}"
+        ids = vstore.add_texts([text_to_embed], metadatas=[data])
+        
+        data['astra_db_id'] = ids[0] if ids else None
+        return json.dumps(data)
+    except Exception as e:
+        return f'{{"error": "Failed to extract or store data.", "details": "{str(e)}", "llm_output": "{response_content}"}}'
+
+@tool
+def classify_adverse_event(event_description: str) -> str:
+    """
+    Analyzes an event description to classify if it is an 'Adverse Event' or 'Not an Adverse Event'.
+    The input is the event_description string.
+    """
+    prompt = f"Is the following an adverse event? Answer only 'Yes' or 'No'. Description: {event_description}"
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
+@tool
+def classify_seriousness(event_description: str) -> str:
+    """
+    Classifies the seriousness of an adverse event into categories like Death, Life-Threatening, Hospitalization, etc.
+    The input is the event_description string.
+    """
+    prompt = f"""
+    Review the event description. Does it meet any seriousness criteria: Death, Life-Threatening, Hospitalization, Disability, Congenital Anomaly? 
+    Return a Python list of the criteria that apply as a string. If none, return an empty list '[]'.
+    Description: {event_description}
+    """
+    response = llm.invoke(prompt)
+    return response.content.strip()
+--- CODE END ---
+
+---
+
+### [ ] Task 2: Refine Agents to Use Tools Correctly
+
+**File:** `agents.py`
+**Action:** Replace the entire content of this file. This version simplifies the agent structure. We will combine Triage and Extraction into one agent to streamline the process and make the workflow more robust.
+
+--- CODE START ---
+from crewai import Agent
+from langchain_google_genai import ChatGoogleGenerativeAI
+from tools import extract_and_store_data, classify_adverse_event, classify_seriousness
+
+# Initialize the Gemini LLM
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.1)
+
+# Agent 1: The Data Processor Agent
+data_processor_agent = Agent(
+    role='Medical Document Processor',
+    goal='Efficiently process an incoming medical document by extracting key information and storing it in the database.',
+    backstory=(
+        "You are an expert AI assistant specialized in pharmacovigilance. "
+        "Your primary function is to read medical forms, extract structured data with perfect accuracy, "
+        "and save it to the knowledge base using the 'extract_and_store_data' tool."
+    ),
+    tools=[extract_and_store_data],
+    llm=llm,
+    allow_delegation=False,
+    verbose=True
+)
+
+# Agent 2: The Safety Assessment Agent
+safety_agent = Agent(
+    role='Adverse Event Safety Assessor',
+    goal='Analyze the extracted event description to determine if it constitutes an adverse event.',
+    backstory='A clinical expert AI trained to classify medical events as either adverse or not, based on standard safety definitions.',
+    tools=[classify_adverse_event],
+    llm=llm,
+    allow_delegation=False,
+    verbose=True
+)
+
+# Agent 3: The Seriousness Classifier Agent
+seriousness_agent = Agent(
+    role='Clinical Seriousness Classifier',
+    goal='Evaluate an adverse event against established seriousness criteria (e.g., Death, Life-Threatening).',
+    backstory='A specialist AI in pharmacovigilance regulations, responsible for classifying the severity of reported adverse events.',
+    tools=[classify_seriousness],
+    llm=llm,
+    allow_delegation=True, # Can delegate back to safety agent if needed
+    verbose=True
+)
+--- CODE END ---
+
+---
+
+### [ ] Task 3: Update Tasks for the New Agent Structure
+
+**File:** `tasks.py`
+**Action:** Replace the entire content of this file with this simplified, more powerful task structure.
+
+--- CODE START ---
+from crewai import Task
+from agents import data_processor_agent, safety_agent, seriousness_agent
+
+# Task 1: Process and store the document
+process_and_store_task = Task(
+    description=(
+        "Take the full text content of the medical document provided as input. "
+        "Your first and only job is to use the 'extract_and_store_data' tool to process it. "
+        "Pass the entire document text to the tool."
+    ),
+    expected_output=(
+        "A JSON string containing the extracted data and the AstraDB database ID."
+    ),
+    agent=data_processor_agent
+)
+
+# Task 2: Assess for adverse event
+assessment_task = Task(
+    description=(
+        "Using the 'event_description' from the JSON output of the previous task, "
+        "use the 'classify_adverse_event' tool to classify if the event is adverse."
+    ),
+    expected_output=(
+        'The classification result ("Yes" or "No").'
+    ),
+    agent=safety_agent,
+    context=[process_and_store_task]
+)
+
+# Task 3: Classify seriousness
+seriousness_task = Task(
+    description=(
+        "Using the 'event_description' from the first task's output and the classification from the second task, "
+        "determine the final report. If the event was 'Yes' (adverse), use the 'classify_seriousness' tool. "
+        "Compile a final JSON report including the extracted data, the adverse event status, and the seriousness criteria."
+    ),
+    expected_output=(
+        'A final JSON object containing all extracted data and all classifications.'
+    ),
+    agent=seriousness_agent,
+    context=[process_and_store_task, assessment_task]
+)
+--- CODE END ---
+
+---
+
+### [ ] Task 4: Build a Professional Streamlit UI with Live Logging
+
+**File:** `app.py`
+**Action:** Replace the entire content of your `app.py` file. This new version includes real-time logging to show the agents' thought process, which is very impressive in a demo.
+
+--- CODE START ---
+import streamlit as st
+from crewai import Crew, Process
+from agents import data_processor_agent, safety_agent, seriousness_agent
+from tasks import process_and_store_task, assessment_task, seriousness_task
+from dotenv import load_dotenv
+import tempfile
+import os
+import io
+import contextlib
+
+# Load environment variables
+load_dotenv()
+
+# Streamlit Page Configuration
+st.set_page_config(page_title="CogniVigilance AI", layout="wide")
+st.title("⚕️ CogniVigilance: AI Agent Workflow for Pharmacovigilance")
+
+# --- UI Sidebar for Inputs ---
+with st.sidebar:
+    st.header("Upload Document")
+    uploaded_file = st.file_uploader(
+        "Upload a medical report (.txt or .pdf)",
+        type=['txt', 'pdf']
+    )
+
+# --- Main Page ---
+if uploaded_file is not None:
+    # Save the uploaded file to a temporary location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
+
+    st.success(f"Uploaded `{uploaded_file.name}`")
+
+    if st.button("Begin Processing", type="primary"):
+        # Create a placeholder for the live log
+        log_container = st.expander("Agent Thought Process...", expanded=True)
+        log_placeholder = log_container.empty()
+        
+        # Capture the output of the crew's execution
+        output_buffer = io.StringIO()
+        with contextlib.redirect_stdout(output_buffer):
+            # Assemble the crew
+            medical_crew = Crew(
+                agents=[data_processor_agent, safety_agent, seriousness_agent],
+                tasks=[process_and_store_task, assessment_task, seriousness_task],
+                process=Process.sequential,
+                verbose=2
+            )
+            
+            # Kick off the process with the raw text
+            document_text = ""
+            with open(tmp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                document_text = f.read()
+
+            result = medical_crew.kickoff(inputs={'document_text': document_text})
+
+        # Display the captured log
+        log_placeholder.code(output_buffer.getvalue())
+
+        # Display the final result
+        st.markdown("---")
+        st.subheader("Final Analysis Report:")
+        st.json(result)
+        st.success("Document processing complete!")
+
+        # Clean up the temporary file
+        os.remove(tmp_file_path)
+else:
+    st.info("Please upload a document to begin processing.")
+--- CODE END ---

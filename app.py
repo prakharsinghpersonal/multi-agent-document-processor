@@ -40,7 +40,7 @@ if uploaded_file is not None:
                 agents=[triage_agent, extraction_agent, safety_agent, seriousness_agent],
                 tasks=[triage_task, extraction_task, assessment_task, seriousness_task],
                 process=Process.sequential,
-                verbose=2
+                verbose=True
             )
 
             # Kick off the process with the file path as input
